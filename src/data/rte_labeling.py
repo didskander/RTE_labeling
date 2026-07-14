@@ -1,125 +1,187 @@
+import re
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import pandas as pd
+from pathlib import Path
 from scipy.signal import savgol_filter
-import os
+from scipy.integrate import trapezoid
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent
+EXCEL_PATH = Path(r"C:\Users\didsk\Desktop\Relay-protection\src\data\manual_label_RTE.xlsx")
 DATA_PATH = r"C:\Users\didsk\Desktop\Relay-protection\src\data\rte_events\DATA_S.npz"
-OUT_DIR   = r"C:\Users\didsk\Desktop\Relay-protection\plots"
-os.makedirs(OUT_DIR, exist_ok=True)
+OUT_PATH = BASE_DIR / "manual_label_RTE_with_features_fixed.xlsx"
 
-FS      = 6400
-CYCLE   = 128
-V_STEP  = 18.310
-I_STEP  = 4.314
-V_NOM   = 90000 / np.sqrt(2)   # ~63,640 V RMS nominal
+FS = 6400
+CYCLE = 128
+V_STEP = 18.310
+I_STEP = 4.314
 
+SMOOTH_WINDOW = 11
+SMOOTH_POLY = 3
+PRE_CYCLES = 5
+BASE_SCALE = 4.0
+MIN_RUN = 3
 
-raw    = np.load(DATA_PATH)
+raw = np.load(DATA_PATH)
 DATA_S = raw[list(raw.keys())[0]].astype(np.float64)
-t      = np.arange(21000) / FS   # time axis in seconds
 
 
-def find_fault_start(event):
-    signals = [event[ch] * (V_STEP if ch < 3 else I_STEP) for ch in range(6)]
-    # smooth each signal with a n-sample window to kill sensor noise
-    derivs  = [np.abs(np.diff(savgol_filter(s, 13, 3))) * FS for s in signals]
-    # worst spike across all 6 channels at each sample
-    combined = np.max(np.stack(derivs), axis=0)
+def norm(x):
+    if pd.isna(x):
+        return ""
+    return str(x).strip().lower()
 
 
-    pre = combined[:2 * CYCLE]
+def extract_phases(fault_type, phase_text):
+    txt = f"{norm(fault_type)} {norm(phase_text)}"
+
+    if "3-p-sc" in txt or "3 phase" in txt or "3-phase" in txt:
+        return ["a", "b", "c"]
+    if "a-b" in txt or "b-a" in txt:
+        return ["a", "b"]
+    if "b-c" in txt or "c-b" in txt:
+        return ["b", "c"]
+    if "c-a" in txt or "a-c" in txt:
+        return ["c", "a"]
+
+    singles = []
+    for p in ["a", "b", "c"]:
+        if re.search(rf"\b{p}\b", txt):
+            singles.append(p)
+
+    return singles[:1] if len(singles) == 1 else []
+
+
+def phase_channels(phases):
+    mapping = {"a": (3, 0), "b": (4, 1), "c": (5, 2)}
+    out = []
+    for p in phases:
+        out.extend(mapping[p])
+
+    seen = set()
+    uniq = []
+    for c in out:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+
+    return uniq if uniq else [0, 1, 2, 3, 4, 5]
+
+
+def first_run(mask, min_run):
+    run = 0
+    for i, val in enumerate(mask):
+        if val:
+            run += 1
+            if run >= min_run:
+                return i - min_run + 1
+        else:
+            run = 0
+    return None
+
+
+def rms(x):
+    return float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
+
+
+def derivative_envelope(event, channels):
+    scores = []
+    for ch in channels:
+        scale = V_STEP if ch < 3 else I_STEP
+        sig = event[ch] * scale
+        sig = savgol_filter(sig, SMOOTH_WINDOW, SMOOTH_POLY)
+        scores.append(np.abs(np.diff(sig)) * FS)
+    return np.max(np.stack(scores), axis=0)
+
+
+def detect_start(event, fault_type, phase_text):
+    chs = phase_channels(extract_phases(fault_type, phase_text))
+    env = derivative_envelope(event, chs)
+    pre = env[:PRE_CYCLES * CYCLE]
     base = np.median(pre)
-    mad  = np.median(np.abs(pre - base))
-    thr  = base + 2 * mad + 1e-9
+    mad = np.median(np.abs(pre - base)) + 1e-12
+    thr = base + BASE_SCALE * mad
+    idx = first_run(env > thr, MIN_RUN)
+    if idx is not None:
+        return idx
 
-    hits = np.where(combined > thr)[0]
-    return int(hits[0]) if len(hits) > 0 else 0
+    env = derivative_envelope(event, [0, 1, 2, 3, 4, 5])
+    pre = env[:PRE_CYCLES * CYCLE]
+    base = np.median(pre)
+    mad = np.median(np.abs(pre - base)) + 1e-12
+    thr = base + BASE_SCALE * mad
+    idx = first_run(env > thr, MIN_RUN)
+    if idx is not None:
+        return idx
+
+    vr = np.stack([
+        np.array([
+            rms(event[ch][k * CYCLE:(k + 1) * CYCLE] * V_STEP)
+            for k in range(len(event[ch]) // CYCLE)
+        ])
+        for ch in range(3)
+    ])
+    for k in range(1, vr.shape[1]):
+        prev_dead = np.max(vr[:, k - 1]) < 5000.0
+        now_live = np.min(vr[:, k]) > 20000.0
+        if prev_dead and now_live:
+            return k * CYCLE
+
+    ir0 = np.array([rms(event[3 + ch][:CYCLE] * I_STEP) for ch in range(3)])
+    ir_all = np.array([rms(event[3 + ch] * I_STEP) for ch in range(3)])
+    if np.max(ir0) > 80.0 and np.max(ir0) > 0.7 * np.max(ir_all):
+        return 0
+
+    return 0
 
 
+def zero_seq_features(event, start_sample):
+    ia = event[3][start_sample:] * I_STEP
+    ib = event[4][start_sample:] * I_STEP
+    ic = event[5][start_sample:] * I_STEP
 
-def classify(event, fs):
-    end = min(fs + 2 * CYCLE, 21000)
-    i = [event[3+ch][fs:end] * I_STEP for ch in range(3)]
-    v = [event[ch][fs:end]   * V_STEP for ch in range(3)]
+    z = ia + ib + ic
+    t = np.arange(len(z)) / FS
 
-    ri = np.array([np.sqrt(np.mean(x**2)) for x in i])
-    rv = np.array([np.sqrt(np.mean(x**2)) for x in v])
+    ratio = float(np.mean(np.abs(z)) / (np.mean(np.abs(ia) + np.abs(ib) + np.abs(ic)) + 1e-9))
+    integral = float(trapezoid(np.abs(z), t))
 
-    
-    n = int((ri > 0.60 * ri.max()).sum())
-
-    # zero sequence: if i1+i2+i3 ≠ 0 → ground is involved
-    zs = np.mean(np.abs(i[0] + i[1] + i[2]))
-    ti = np.mean(np.abs(i[0]) + np.abs(i[1]) + np.abs(i[2])) + 1e-9
-    gnd = zs / ti   # > 0.10 = ground fault
-
-    # voltage sag per phase (how much below nominal?)
-    sag = [max(0, 1 - rv[ch] / V_NOM) for ch in range(3)]
-
-    if   n == 1:                       label = "SLG"
-    elif n == 2 and gnd < 0.08:        label = "LL"
-    elif n == 2 and gnd >= 0.08:       label = "LLG"
-    elif n == 3 and gnd < 0.08:        label = "LLL"
-    else:                              label = "LLLG"
-
-    return label, ri, rv, sag, gnd, n
+    return ratio, integral
 
 
+df = pd.read_excel(EXCEL_PATH, engine="openpyxl")
 
-colors = ['#636EFA', '#EF553B', '#00CC96']
+col_map = {str(c).strip().lower(): c for c in df.columns}
+sample_col = col_map["sample id"]
+ft_col = col_map["fault type"]
+ph_col = col_map["phase"]
 
-for ev in range(5):
-    event       = DATA_S[ev]
-    fault_samp  = find_fault_start(event)
-    fault_time  = fault_samp / FS
-    label, ri, rv, sag, gnd, n = classify(event, fault_samp)
+start_times = []
+ratios = []
+integrals = []
 
-    i_phys = [event[3+ch] * I_STEP for ch in range(3)]
-    v_phys = [event[ch]   * V_STEP for ch in range(3)]
+for _, row in df.iterrows():
+    sid = row[sample_col]
 
-    fig = make_subplots(
-        rows=2, cols=1,
-        subplot_titles=[
-            f"Current (A) — phases elevated: {n}  |  ground ratio: {gnd:.2f}",
-            f"Voltage (V) — sag: v1={sag[0]:.0%}  v2={sag[1]:.0%}  v3={sag[2]:.0%}"
-        ],
-        vertical_spacing=0.15
-    )
+    if pd.isna(sid) or int(sid) < 0 or int(sid) >= len(DATA_S):
+        start_times.append("")
+        ratios.append("")
+        integrals.append("")
+        continue
 
-    for ch in range(3):
-        fig.add_trace(go.Scatter(
-            x=t, y=i_phys[ch],
-            name=f"i{ch+1}  RMS={ri[ch]:.0f}A",
-            line=dict(color=colors[ch])
-        ), row=1, col=1)
+    event = DATA_S[int(sid)]
 
-        fig.add_trace(go.Scatter(
-            x=t, y=v_phys[ch],
-            name=f"v{ch+1}  RMS={rv[ch]/1000:.1f}kV",
-            line=dict(color=colors[ch]),
-            showlegend=True
-        ), row=2, col=1)
+    st = detect_start(event, row[ft_col], row[ph_col])
+    zr, zi = zero_seq_features(event, st)
 
-    # red line = fault start
-    for row in [1, 2]:
-        fig.add_vline(x=fault_time, line_color="red",
-                      line_dash="dash", annotation_text=f"fault@{fault_time:.3f}s",
-                      row=row, col=1)
+    start_times.append(st / FS)
+    ratios.append(zr)
+    integrals.append(zi)
 
-    fig.update_xaxes(title_text="Time (s)")
-    fig.update_yaxes(title_text="Current (A)", row=1, col=1)
-    fig.update_yaxes(title_text="Voltage (V)", row=2, col=1)
-    fig.update_layout(
-        title=f"Event {ev}  →  Classified: <b>{label}</b>",
-        height=700,
-        legend=dict(orientation='h', y=-0.12, x=0.5, xanchor='center')
-    )
+df["fault_start_time_s"] = start_times
+df["zero_seq_ratio"] = ratios
+df["zero_seq_integral"] = integrals
 
-    path = os.path.join(OUT_DIR, f"event_{ev}.html")
-    fig.write_html(path)
-    print(f"Event {ev}: fault at t={fault_time:.3f}s | label={label} | "
-          f"n_phases={n} | gnd={gnd:.3f} | "
-          f"i_rms={ri.round(0)} | v_sag={[f'{s:.0%}' for s in sag]}")
+with pd.ExcelWriter(OUT_PATH, engine="openpyxl") as writer:
+    df.to_excel(writer, index=False, sheet_name="Sheet1")
 
+print(f"Saved to: {OUT_PATH}")
