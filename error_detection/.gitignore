@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Environments / editors
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data: ignore everything except the README
+data/*
+!data/README.md
+
+# If labels/processed/raw exist inside data, they stay ignored
+# because only data/README.md is re-included
+
+# Generated outputs
+output/
+output/figures/
+output/metrics/
+output/models/
+
+# Optional logs
+*.log
